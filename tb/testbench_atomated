@@ -1,0 +1,337 @@
+`timescale 1ns/1ps
+
+module tb_automated_system;
+
+    localparam integer NUM_FRAMES = 500;
+    localparam integer PAYLOAD_BITS = 4;
+    localparam integer TAIL_BITS = 2;
+    localparam integer PAIRS_PER_FRAME = PAYLOAD_BITS + TAIL_BITS;
+    localparam integer CODED_BITS_PER_FRAME = PAIRS_PER_FRAME * 2;
+    localparam integer DUMP_WAVEFORM = 0;
+
+    reg clk;
+    reg rst;
+    reg tx_bit;
+    reg tx_valid;
+
+    reg inject_enable;
+    reg [5:0] inject_index;
+    reg [1:0] error_mask;
+
+    reg start_decode;
+    reg [5:0] payload_length;
+
+    wire [1:0] encoded_pair;
+    wire encoded_valid;
+    wire [1:0] received_pair;
+    wire received_valid;
+    wire error_injected;
+
+    wire decoded_bit;
+    wire decoded_valid;
+    wire decoder_busy;
+    wire decode_done;
+
+    reg [3:0] random_payload;
+    reg [3:0] recovered_nibble;
+
+    integer frame_id;
+    integer file_handle;
+
+    integer received_symbol_count;
+    integer recovered_count;
+    integer channel_bit_errors_this_frame;
+    integer payload_bit_errors_this_frame;
+
+    integer total_frames;
+    integer passed_frames;
+    integer failed_frames;
+    integer frames_with_injected_errors;
+    integer total_channel_bit_errors;
+    integer total_payload_bit_errors;
+
+    integer planned_error_index;
+    reg [1:0] planned_error_mask;
+    reg planned_error_enable;
+
+    comm_system dut (
+        .clk(clk),
+        .rst(rst),
+        .tx_bit(tx_bit),
+        .tx_valid(tx_valid),
+        .inject_enable(inject_enable),
+        .inject_index(inject_index),
+        .error_mask(error_mask),
+        .start_decode(start_decode),
+        .payload_length(payload_length),
+        .encoded_pair(encoded_pair),
+        .encoded_valid(encoded_valid),
+        .received_pair(received_pair),
+        .received_valid(received_valid),
+        .error_injected(error_injected),
+        .decoded_bit(decoded_bit),
+        .decoded_valid(decoded_valid),
+        .decoder_busy(decoder_busy),
+        .decode_done(decode_done)
+    );
+
+    always #5 clk = ~clk;
+
+    function integer count_ones_4;
+        input [3:0] value;
+        begin
+            count_ones_4 = value[0] + value[1] + value[2] + value[3];
+        end
+    endfunction
+
+    task reset_frame;
+        begin
+            rst = 1'b1;
+            tx_bit = 1'b0;
+            tx_valid = 1'b0;
+            inject_enable = 1'b0;
+            inject_index = 6'd0;
+            error_mask = 2'b00;
+            start_decode = 1'b0;
+            payload_length = PAYLOAD_BITS;
+
+            received_symbol_count = 0;
+            recovered_count = 0;
+            recovered_nibble = 4'b0000;
+            channel_bit_errors_this_frame = 0;
+
+            repeat (2) @(negedge clk);
+            rst = 1'b0;
+        end
+    endtask
+
+    task configure_channel;
+        input enable_error;
+        input [5:0] pair_index;
+        input [1:0] mask;
+        begin
+            @(negedge clk);
+            inject_enable = enable_error;
+            inject_index = pair_index;
+            error_mask = mask;
+        end
+    endtask
+
+    task send_bit;
+        input data_value;
+        begin
+            @(negedge clk);
+            tx_bit = data_value;
+            tx_valid = 1'b1;
+
+            @(negedge clk);
+            tx_valid = 1'b0;
+        end
+    endtask
+
+    task send_frame;
+        input [3:0] payload;
+        begin
+            send_bit(payload[3]);
+            send_bit(payload[2]);
+            send_bit(payload[1]);
+            send_bit(payload[0]);
+
+            send_bit(1'b0);
+            send_bit(1'b0);
+        end
+    endtask
+
+    task launch_decoder;
+        begin
+            while (received_symbol_count < PAIRS_PER_FRAME) begin
+                @(negedge clk);
+            end
+
+            @(negedge clk);
+
+            start_decode = 1'b1;
+            @(negedge clk);
+            start_decode = 1'b0;
+        end
+    endtask
+
+    task wait_for_decoder;
+        begin
+            wait (decode_done === 1'b1);
+            @(negedge clk);
+            #1;
+        end
+    endtask
+
+    always @(negedge clk) begin
+        if (!rst) begin
+            if (received_valid) begin
+                received_symbol_count = received_symbol_count + 1;
+            end
+
+            if (received_valid && error_injected) begin
+                if (error_mask == 2'b11) begin
+                    channel_bit_errors_this_frame = channel_bit_errors_this_frame + 2;
+                end else if (error_mask != 2'b00) begin
+                    channel_bit_errors_this_frame = channel_bit_errors_this_frame + 1;
+                end
+            end
+
+            if (decoded_valid && recovered_count < PAYLOAD_BITS) begin
+                recovered_nibble[3 - recovered_count] = decoded_bit;
+                recovered_count = recovered_count + 1;
+            end
+        end
+    end
+
+    initial begin
+        clk = 1'b0;
+        rst = 1'b1;
+        tx_bit = 1'b0;
+        tx_valid = 1'b0;
+        inject_enable = 1'b0;
+        inject_index = 6'd0;
+        error_mask = 2'b00;
+        start_decode = 1'b0;
+        payload_length = PAYLOAD_BITS;
+
+        total_frames = 0;
+        passed_frames = 0;
+        failed_frames = 0;
+        frames_with_injected_errors = 0;
+        total_channel_bit_errors = 0;
+        total_payload_bit_errors = 0;
+
+        if (DUMP_WAVEFORM) begin
+            $dumpfile("automated_viterbi.vcd");
+            $dumpvars(0, tb_automated_system);
+        end
+
+        file_handle = $fopen("simulation_results.csv", "w");
+
+        if (file_handle == 0) begin
+            $display("ERROR: Could not create simulation_results.csv");
+            $finish;
+        end
+
+        $fwrite(
+            file_handle,
+            "Frame_ID,Transmitted_Data,Error_Pair_Index,Error_Mask,Channel_Bit_Errors,Decoded_Data,Payload_Bit_Errors,Status\n"
+        );
+
+        for (frame_id = 0; frame_id < NUM_FRAMES; frame_id = frame_id + 1) begin
+            reset_frame;
+
+            random_payload = $urandom_range(0, 15);
+
+            if (frame_id < (NUM_FRAMES / 2)) begin
+                planned_error_enable = 1'b0;
+                planned_error_index = -1;
+                planned_error_mask = 2'b00;
+            end else begin
+                planned_error_enable = 1'b1;
+                planned_error_index = $urandom_range(0, PAIRS_PER_FRAME - 1);
+
+                if ($urandom_range(0, 1) == 0) begin
+                    planned_error_mask = 2'b01;
+                end else begin
+                    planned_error_mask = 2'b10;
+                end
+            end
+
+            configure_channel(
+                planned_error_enable,
+                planned_error_index[5:0],
+                planned_error_mask
+            );
+
+            send_frame(random_payload);
+            launch_decoder;
+            wait_for_decoder;
+
+            if (recovered_count != PAYLOAD_BITS) begin
+                payload_bit_errors_this_frame = PAYLOAD_BITS;
+            end else if (^recovered_nibble === 1'bx) begin
+                payload_bit_errors_this_frame = PAYLOAD_BITS;
+            end else begin
+                payload_bit_errors_this_frame =
+                    count_ones_4(random_payload ^ recovered_nibble);
+            end
+
+            total_frames = total_frames + 1;
+            total_channel_bit_errors =
+                total_channel_bit_errors + channel_bit_errors_this_frame;
+
+            total_payload_bit_errors =
+                total_payload_bit_errors + payload_bit_errors_this_frame;
+
+            if (planned_error_enable) begin
+                frames_with_injected_errors =
+                    frames_with_injected_errors + 1;
+            end
+
+            if (payload_bit_errors_this_frame == 0) begin
+                passed_frames = passed_frames + 1;
+
+                $fwrite(
+                    file_handle,
+                    "%0d,%b,%0d,%b,%0d,%b,%0d,PASS\n",
+                    frame_id,
+                    random_payload,
+                    planned_error_index,
+                    planned_error_mask,
+                    channel_bit_errors_this_frame,
+                    recovered_nibble,
+                    payload_bit_errors_this_frame
+                );
+            end else begin
+                failed_frames = failed_frames + 1;
+
+                $fwrite(
+                    file_handle,
+                    "%0d,%b,%0d,%b,%0d,%b,%0d,FAIL\n",
+                    frame_id,
+                    random_payload,
+                    planned_error_index,
+                    planned_error_mask,
+                    channel_bit_errors_this_frame,
+                    recovered_nibble,
+                    payload_bit_errors_this_frame
+                );
+            end
+        end
+
+        $fclose(file_handle);
+
+        $display("================================================");
+        $display("Automated Viterbi Simulation Complete");
+        $display("================================================");
+        $display("Total Frames Tested:           %0d", total_frames);
+        $display("Frames With Injected Errors:   %0d", frames_with_injected_errors);
+        $display("Passed Frames:                 %0d", passed_frames);
+        $display("Failed Frames:                 %0d", failed_frames);
+        $display("Total Channel Bit Errors:      %0d", total_channel_bit_errors);
+        $display("Total Payload Bit Errors:      %0d", total_payload_bit_errors);
+        $display(
+            "Channel BER:                   %0.6f",
+            (total_channel_bit_errors * 1.0) /
+            (total_frames * CODED_BITS_PER_FRAME)
+        );
+        $display(
+            "Decoded Payload BER:           %0.6f",
+            (total_payload_bit_errors * 1.0) /
+            (total_frames * PAYLOAD_BITS)
+        );
+        $display(
+            "Frame Success Rate:            %0.2f%%",
+            (passed_frames * 100.0) / total_frames
+        );
+        $display("CSV requested: simulation_results.csv");
+        $display("================================================");
+
+        #20;
+        $finish;
+    end
+
+endmodule
